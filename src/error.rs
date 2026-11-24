@@ -3,7 +3,7 @@
 use core::fmt;
 
 /// Errors returned when parsing Rareware GBA sample descriptors, song headers, or audio streams.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Error {
     /// Input buffer ended before a complete descriptor or payload could be read.

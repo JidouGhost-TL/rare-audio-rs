@@ -183,7 +183,7 @@ impl RareSampleDesc {
     #[inline]
     #[must_use]
     pub const fn sample_len(&self) -> usize {
-        (self.sample_end_ptr - self.sample_start_ptr) as usize
+        self.sample_end_ptr.saturating_sub(self.sample_start_ptr) as usize
     }
 
     /// Returns `true` if this descriptor loops during playback.
@@ -198,7 +198,7 @@ impl RareSampleDesc {
     #[must_use]
     pub const fn loop_start(&self) -> Option<usize> {
         if self.is_looped() {
-            Some(self.sample_len() - (self.loop_length as usize))
+            Some(self.sample_len().saturating_sub(self.loop_length as usize))
         } else {
             None
         }
@@ -208,7 +208,7 @@ impl RareSampleDesc {
     #[inline]
     #[must_use]
     pub const fn rom_pcm_offset(&self) -> usize {
-        (self.sample_start_ptr - GBA_ROM_BUS_BASE) as usize
+        self.sample_start_ptr.saturating_sub(GBA_ROM_BUS_BASE) as usize
     }
 }
 
@@ -387,7 +387,7 @@ impl<'a> RareSampleView<'a> {
 
 /// Heap-allocated Rareware GBA signed 8-bit PCM sample (`alloc` feature).
 #[cfg(feature = "alloc")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RareSample {
     /// Logical sample index.
     pub index: usize,

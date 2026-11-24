@@ -726,7 +726,11 @@ impl StudioSynth {
     #[inline]
     #[must_use]
     pub fn equal_power_gains(pan: f32) -> (f32, f32) {
-        let p = (pan as f64).clamp(-1.0, 1.0);
+        let p = if pan.is_finite() {
+            (pan as f64).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
         let gain_l = sqrt_f64(0.5 * (1.0 - p)) as f32;
         let gain_r = sqrt_f64(0.5 * (1.0 + p)) as f32;
         (gain_l, gain_r)
@@ -737,6 +741,11 @@ impl StudioSynth {
     #[inline]
     #[must_use]
     pub fn sample_lanczos3(sample: &RareSampleView<'_>, pos: usize, frac: f64) -> f32 {
+        let frac = if frac.is_finite() {
+            frac.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let phase_idx = ((frac * (LANCZOS_PHASES as f64) + 0.5) as usize).min(LANCZOS_PHASES);
         let w = &LANCZOS3_LUT[phase_idx];
         let effective_len = sample.sample_len.min(sample.pcm.len());
@@ -759,9 +768,9 @@ impl StudioSynth {
         }
 
         let len = effective_len as isize;
-        let is_looped = sample.is_looped();
         let loop_len = sample.loop_length as isize;
-        let loop_start = len - loop_len;
+        let is_looped = sample.is_looped() && loop_len > 0 && loop_len <= len;
+        let loop_start = if is_looped { len - loop_len } else { 0 };
 
         let mut acc = 0.0f32;
         for (tap, &wt) in w.iter().enumerate() {
@@ -769,7 +778,7 @@ impl StudioSynth {
             if idx < 0 {
                 idx = 0;
             } else if idx >= len {
-                if is_looped && loop_len > 0 {
+                if is_looped {
                     idx = loop_start + ((idx - loop_start) % loop_len);
                 } else {
                     idx = len - 1;

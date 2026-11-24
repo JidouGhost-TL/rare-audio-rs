@@ -22,6 +22,42 @@
 //! - **Byte-Exact mGBA ARM Golden Tested**: 2,688 / 2,688 output bytes verified strictly
 //!   byte-for-byte against real ARM7TDMI execution in headless `libmgba` across all 4
 //!   Rareware GBA mixer revisions.
+//!
+//! ## Quickstart
+//!
+//! ```rust
+//! use rare_audio::{
+//!     AccuracySynth, RareAudioVersion, RarePlaybackMode, RareSampleView, RareVoice,
+//!     RARE_DEFAULT_FRAME_SAMPLES, RARE_DEFAULT_MIX_RATE,
+//! };
+//!
+//! // Signed 8-bit PCM with 1-byte interpolation guard
+//! let pcm_i8: &[u8] = &[0, 32, 64, 96, 64, 32, 0, 224, 192, 160, 192, 224, 0];
+//! let sample = RareSampleView::from_signed_pcm(
+//!     0,
+//!     RARE_DEFAULT_MIX_RATE,
+//!     60,
+//!     RarePlaybackMode::MidiLooped,
+//!     12,
+//!     pcm_i8,
+//!     true,
+//! );
+//!
+//! let mut voice = RareVoice::new(0, RarePlaybackMode::MidiLooped, RARE_DEFAULT_MIX_RATE, 128);
+//! let mut acc = [0i16; RARE_DEFAULT_FRAME_SAMPLES];
+//! let mut dma = [0i8; RARE_DEFAULT_FRAME_SAMPLES];
+//!
+//! AccuracySynth::mix_voice_view_version(
+//!     &sample,
+//!     &mut voice,
+//!     &mut acc,
+//!     true,
+//!     RareAudioVersion::StandardSingleClamp,
+//! );
+//! AccuracySynth::clamp_i16_to_dma8(&acc, &mut dma);
+//! assert_eq!(dma[0], 0);
+//! assert_eq!(dma[3], 96);
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]

@@ -87,6 +87,22 @@ Every mixing and clamping path in `AccuracySynth` is verified strictly byte-for-
 
 ---
 
+## Benchmarks
+
+```sh
+cargo bench --bench bench_audio
+```
+
+| Benchmark | Throughput |
+| --- | ---: |
+| `AccuracySynth::mix_voice_view` (Standard 1:1, 224f) | ~19.31 GSamples/s |
+| `AccuracySynth::mix_voice_view` (Standard resampled, 224f) | ~1.17 GSamples/s |
+| `AccuracySynth::mix_voice_view_version` (`PackedFastPath`, 224f) | ~1.13 GSamples/s |
+| `AccuracySynth::clamp_i16_to_dma8` (224f) | ~46.28 GSamples/s |
+| `StudioSynth::mix_voice_view_stereo` (48 kHz Lanczos-3, 1,024f) | ~400.5 MSamples/s |
+
+---
+
 ## License
 
 Licensed under either of:
