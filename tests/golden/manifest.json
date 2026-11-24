@@ -1,0 +1,78 @@
+{
+  "generator": "libmgba.so.0.10 ARM7TDMI real Rareware mixer execution",
+  "vectors": [
+    {
+      "file": "dkc1_linear_1to1.bin",
+      "variant": "StandardSingleClamp",
+      "bytes": 224,
+      "sha256": "10442cf1d2dd70f585bc9a70af98801bb62cf3cf79344683ec11019814ba4475"
+    },
+    {
+      "file": "dkc1_linear_resampled.bin",
+      "variant": "StandardSingleClamp",
+      "bytes": 224,
+      "sha256": "140a1e3ac5e902e789d80288968d0e976381838b1a8d8ae45489173ad991fe6e"
+    },
+    {
+      "file": "dkc1_loop_wrap.bin",
+      "variant": "StandardSingleClamp",
+      "bytes": 224,
+      "sha256": "50a00ee2d4d7caddc32cc1b8a6f38c56814308fd65de4b546a8f0ee24d2d1e28"
+    },
+    {
+      "file": "dkc1_oneshot_end.bin",
+      "variant": "StandardSingleClamp",
+      "bytes": 224,
+      "sha256": "bec82c973ba9e188690fd5996336d6e840ea02e6580aff9cb027b4e4d7e915a3"
+    },
+    {
+      "file": "dkc1_multi_clamped.bin",
+      "variant": "StandardSingleClamp",
+      "bytes": 224,
+      "sha256": "f9bf4fbff7adbe670c621a54ebe4a8ebcd279bf917500ccbe25255bc32089450"
+    },
+    {
+      "file": "dkc2_resampled_dualhalf.bin",
+      "variant": "StandardDualHalfClamp",
+      "bytes": 224,
+      "sha256": "cc46cfe54c218ef668f0647e4f3b1864149b6462ae73178d33c697050f58d610"
+    },
+    {
+      "file": "dkc2_multi_clamped_dualhalf.bin",
+      "variant": "StandardDualHalfClamp",
+      "bytes": 224,
+      "sha256": "3f15614486f7d1f8a420ff0dd09dab3fea64f98dc31ee106eb1273c6fe04f9cc"
+    },
+    {
+      "file": "dkc3_resampled_dualbyte.bin",
+      "variant": "StandardDualByteClamp",
+      "bytes": 224,
+      "sha256": "a5f4a7d2fde9c6a29d7d91c2954b1472281af4f5e010416949891b1d05efc190"
+    },
+    {
+      "file": "dkc3_multi_clamped_dualbyte.bin",
+      "variant": "StandardDualByteClamp",
+      "bytes": 224,
+      "sha256": "a322760bc853266df4f8161fb9eeb387da720f9f326a2c21078b79f5e82159be"
+    },
+    {
+      "file": "baje_fastpath_bleed.bin",
+      "variant": "PackedFastPath",
+      "bytes": 224,
+      "sha256": "64fb7a1e4c2147711de3751167047eaa9e1d1adecae721f9f84c43b68769d84b"
+    },
+    {
+      "file": "baje_fastpath_multi.bin",
+      "variant": "PackedFastPath",
+      "bytes": 224,
+      "sha256": "1e4e3d450f18f38f7df5c37a343413ef6ea46a0b2fffcb85d063106dedeba6c5"
+    },
+    {
+      "file": "baje_slowpath_loop.bin",
+      "variant": "PackedFastPath",
+      "bytes": 224,
+      "sha256": "50a00ee2d4d7caddc32cc1b8a6f38c56814308fd65de4b546a8f0ee24d2d1e28"
+    }
+  ],
+  "total_bytes": 2688
+}
