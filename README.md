@@ -18,17 +18,17 @@ The **Rareware GBA Sound Engine** is a custom ARM7TDMI IWRAM-accelerated DirectS
 
 - **Zero External Dependencies**: Pure Rust with no dependencies in `[dependencies]`, `#![deny(unsafe_code)]`.
 - **`#![no_std]` Compatible**: Ready for embedded targets and WASM runtimes (`alloc` optional).
-- **Native Rareware Binary Parsers**: Zero-allocation [`RareSampleDesc`] (68-byte / `0x44` descriptor), [`RareSongHeader`] (20-byte / `0x14` song header), and [`RareSampleView`] (signed 8-bit PCM with 1-byte linear-interpolation guard).
+- **Native Rareware Binary Parsers**: Zero-allocation `RareSampleDesc` (68-byte / `0x44` descriptor), `RareSongHeader` (20-byte / `0x14` song header), and `RareSampleView` (signed 8-bit PCM with 1-byte linear-interpolation guard).
 - **Dual Synthesis Engines**:
   - **`AccuracySynth`**: 100% bit-exact emulation of all 4 Rareware GBA ARM7TDMI IWRAM mixer revisions — exact Q9.23 `asr #23` linear interpolation, `(interp * vol) >> 7` scaling, loop wrap (`pos -= loop_length`), one-shot early exit, *Banjo-Pilot*'s lookahead-guarded 2x-packed fast path (including its authentic ARM `add r2, sl, r2, lsl #16` negative-low-halfword `-1` bleed), and DirectSound A `i16 -> i8` clamping.
-  - **`StudioSynth`**: Renders at 48,000 Hz, 32-bit floating-point stereo with a compile-time normalized 6-tap Lanczos-3 windowed-sinc polyphase filter and true equal-power stereo panning.
+  - **`StudioSynth`**: Renders at 48,000 Hz, 32-bit floating-point stereo with a compile-time normalized 1,024-phase 6-tap Lanczos-3 windowed-sinc polyphase filter and true equal-power stereo panning.
 - **Byte-Exact mGBA ARM Golden Tested**: **2,688 / 2,688** output bytes verified strictly byte-for-byte (`assert_eq!`) across all 4 distinct Rareware ARM mixer revisions discovered across all 26 Rareware GBA ROMs.
 
 ---
 
 ## Supported Rareware GBA Mixer Revisions
 
-Auditing all 26 unique Rareware GBA ROMs across the full catalog identified exactly **4 distinct ARM7TDMI IWRAM mixer revisions**, all supported and byte-exact golden-tested via [`RareAudioVersion`] (with automatic detection via [`RareAudioVersion::detect_from_bytes`]):
+Auditing all 26 unique Rareware GBA ROMs across the full catalog identified exactly **4 distinct ARM7TDMI IWRAM mixer revisions**, all supported and byte-exact golden-tested via `RareAudioVersion` (with automatic detection via `RareAudioVersion::detect_from_bytes`):
 
 | Revision | Corpus Share & Representative Titles | Inner Mix Loop | Clamp Kernel | Bit-Exact Quirk |
 | --- | --- | --- | --- | --- |

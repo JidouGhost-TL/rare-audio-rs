@@ -21,7 +21,7 @@
 //!    fast path (zero bleed), `strh` slow-path fallback on end/loop crossing, and `DualHalf` clamping.
 
 /// Hardware DirectSound A clamp routine style used by a Rareware GBA build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RareClampMode {
     /// 1 sample/iter: `ldrsh r3, [r0], #2` -> `cmp #0x7f` / `cmn #0x80` -> `strb r3, [r1], #1`.
     SingleByteLdrsh,

@@ -22,7 +22,7 @@ pub const RARE_DESC_MAGIC_SIZE: u32 = 0x20;
 pub const RARE_SONG_HEADER_SIZE: usize = 20;
 
 /// Playback mode stored at `+0x04` of [`RareSampleDesc`] and `+0x01` of a live voice slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u32)]
 pub enum RarePlaybackMode {
     /// Mode 1: MIDI instrument one-shot sample.
@@ -267,7 +267,7 @@ impl RareSongHeader {
 /// The `pcm` slice holds raw signed 8-bit PCM bytes (`i8` encoded as `u8`). If `pcm.len() > sample_len`,
 /// byte `pcm[sample_len]` serves as the hardware 1-byte linear-interpolation guard byte read by
 /// `ldrsb r2, [r0, #1]` when `pos == sample_len - 1`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RareSampleView<'a> {
     /// Logical sample index.
     pub index: usize,
@@ -288,7 +288,7 @@ pub struct RareSampleView<'a> {
 impl<'a> RareSampleView<'a> {
     /// Wrap a raw signed 8-bit PCM byte slice directly without heap allocation.
     ///
-    /// If `has_guard_byte` is `true` and `pcm.len() > 1`, `sample_len` is `pcm.len() - 1`
+    /// If `has_guard_byte` is `true` and `!pcm.is_empty()`, `sample_len` is `pcm.len() - 1`
     /// and the final byte is used as the ARM `ldrsb r2, [r0, #1]` interpolation guard.
     #[must_use]
     pub const fn from_signed_pcm(

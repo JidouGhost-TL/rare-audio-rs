@@ -5,22 +5,24 @@
 //!   mixer revisions (`StandardSingleClamp`, `StandardDualHalfClamp`, `StandardDualByteClamp`,
 //!   and `PackedFastPath`), verified byte-for-byte (`2,688 / 2,688` bytes) against real
 //!   ARM7TDMI execution in headless `libmgba`.
-//! - [`StudioSynth`]: High-fidelity 48,000 Hz `f32` stereo renderer with compile-time
-//!   normalized 6-tap Lanczos-3 windowed-sinc interpolation and equal-power stereo panning.
+//! - [`StudioSynth`]: High-fidelity 48,000 Hz `f32` stereo renderer with a compile-time
+//!   normalized 1,024-phase 6-tap Lanczos-3 windowed-sinc polyphase LUT and equal-power
+//!   stereo panning.
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-use crate::freq::{RARE_DEFAULT_MIX_RATE, RARE_FRAC_BITS, RARE_FRAC_MASK};
+use crate::freq::{RARE_DEFAULT_MIX_RATE, RARE_FRAC_BITS, RARE_FRAC_MASK, RARE_FRAC_ONE};
 use crate::sample::RareSampleView;
 use crate::version::RareAudioVersion;
 use crate::voice::RareVoice;
 
 /// Number of fractional polyphase steps in [`StudioSynth`]'s compile-time Lanczos-3 LUT.
-const LANCZOS_PHASES: usize = 256;
+const LANCZOS_PHASES: usize = 1024;
 
-/// Compile-time normalized 6-tap Lanczos-3 polyphase lookup table (`257 * 6 * 4 = 6,168` bytes).
-const LANCZOS3_LUT: [[f32; 6]; LANCZOS_PHASES + 1] = build_lanczos3_lut();
+/// Compile-time normalized 1,024-phase 6-tap Lanczos-3 polyphase lookup table
+/// (`1025 * 6 * 4 = 24,600` bytes — L1D-cache resident).
+static LANCZOS3_LUT: [[f32; 6]; LANCZOS_PHASES + 1] = build_lanczos3_lut();
 
 /// Build the normalized 6-tap Lanczos-3 polyphase lookup table at compile time.
 const fn build_lanczos3_lut() -> [[f32; 6]; LANCZOS_PHASES + 1] {
@@ -123,7 +125,7 @@ pub fn sqrt_f64(val: f64) -> f64 {
 ///    2x-packed `add r2, sl, r2, lsl #16` first-voice negative-low-halfword `-1` carry bleed).
 /// 4. Exact loop wrap (`pos -= loop_length`) and one-shot early return (`active = false`).
 /// 5. DirectSound A `i16 -> i8` saturation clamping to `[-128, +127]`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AccuracySynth {
     /// Hardware DirectSound A mixing rate in Hz (default `13,379` Hz).
     pub sample_rate: u32,
@@ -159,6 +161,270 @@ impl AccuracySynth {
         }
     }
 
+    /// Standard per-sample `strh`/`ldrsh` mixer kernel specialized on `IS_FIRST`,
+    /// using interior-run chunking and a 1:1 pitch SIMD fast path while remaining
+    /// 100% bit-exact with Rareware's ARM7TDMI inner loop.
+    #[inline(always)]
+    fn mix_standard_impl<const IS_FIRST: bool>(
+        sample: &RareSampleView<'_>,
+        voice: &mut RareVoice,
+        acc: &mut [i16],
+    ) {
+        const FRAC_MASK_U64: u64 = RARE_FRAC_MASK as u64;
+
+        let n = acc.len();
+        let pcm = sample.pcm;
+        let pcm_len = pcm.len();
+        let sample_len = sample.sample_len;
+        let loop_len = sample.loop_length as usize;
+        let is_looped = voice.playback_mode.is_looped() && loop_len > 0;
+        let step = voice.step_q23;
+        let step_u64 = step as u64;
+        let vol = voice.volume;
+
+        let safe_end = sample_len.min(pcm_len);
+        let limit_pos = sample_len.min(pcm_len.saturating_sub(1));
+
+        let mut pos = voice.pos;
+        let mut frac = voice.frac;
+        let mut offset = 0usize;
+
+        while offset < n {
+            // 1:1 pitch fast path: contiguous slice enables full SIMD auto-vectorization
+            if step == RARE_FRAC_ONE && frac == 0 && pos < safe_end {
+                let run = (safe_end - pos).min(n - offset);
+                let src = &pcm[pos..pos + run];
+                let dst = &mut acc[offset..offset + run];
+
+                if IS_FIRST {
+                    if vol == 128 {
+                        for (&b, slot) in src.iter().zip(dst.iter_mut()) {
+                            *slot = b as i8 as i16;
+                        }
+                    } else {
+                        for (&b, slot) in src.iter().zip(dst.iter_mut()) {
+                            *slot = ((b as i8 as i32).wrapping_mul(vol) >> 7) as i16;
+                        }
+                    }
+                } else if vol == 128 {
+                    for (&b, slot) in src.iter().zip(dst.iter_mut()) {
+                        *slot = slot.wrapping_add(b as i8 as i16);
+                    }
+                } else {
+                    for (&b, slot) in src.iter().zip(dst.iter_mut()) {
+                        *slot = slot.wrapping_add(((b as i8 as i32).wrapping_mul(vol) >> 7) as i16);
+                    }
+                }
+
+                pos += run;
+                offset += run;
+                if pos >= sample_len {
+                    if is_looped {
+                        pos = pos.saturating_sub(loop_len);
+                    } else {
+                        voice.active = false;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // Resampled Q9.23 interior fast path: single 64-bit phase accumulator,
+            // zero per-sample loop-wrap/end checks, and direct adjacent-pair reads.
+            if step > 0 && step <= 0x7FFF_FFFF && frac <= RARE_FRAC_MASK && pos < limit_pos {
+                let ph0 = ((pos as u64) << RARE_FRAC_BITS) | (frac as u64);
+                let limit_ph = (limit_pos as u64) << RARE_FRAC_BITS;
+                let k_max = (limit_ph - 1 - ph0) / step_u64;
+                let run = ((k_max + 1) as usize).min(n - offset);
+
+                let src = &pcm[..limit_pos + 1];
+                let dst = &mut acc[offset..offset + run];
+                let mut ph = ph0;
+                let step2 = step_u64 * 2;
+                let step3 = step_u64 * 3;
+                let step4 = step_u64 * 4;
+
+                let (chunks, rem) = dst.as_chunks_mut::<4>();
+                if IS_FIRST && vol == 128 {
+                    for chunk in chunks {
+                        let p0 = ph;
+                        let p1 = ph + step_u64;
+                        let p2 = ph + step2;
+                        let p3 = ph + step3;
+                        ph += step4;
+
+                        let i0 = (p0 >> RARE_FRAC_BITS) as usize;
+                        let a0 = &src[i0..i0 + 2];
+                        let s0 = a0[0] as i8 as i32;
+                        let d0 = (a0[1] as i8 as i32) - s0;
+                        chunk[0] = (s0 + (((p0 & FRAC_MASK_U64) as i32).wrapping_mul(d0) >> 23)) as i16;
+
+                        let i1 = (p1 >> RARE_FRAC_BITS) as usize;
+                        let a1 = &src[i1..i1 + 2];
+                        let s1 = a1[0] as i8 as i32;
+                        let d1 = (a1[1] as i8 as i32) - s1;
+                        chunk[1] = (s1 + (((p1 & FRAC_MASK_U64) as i32).wrapping_mul(d1) >> 23)) as i16;
+
+                        let i2 = (p2 >> RARE_FRAC_BITS) as usize;
+                        let a2 = &src[i2..i2 + 2];
+                        let s2 = a2[0] as i8 as i32;
+                        let d2 = (a2[1] as i8 as i32) - s2;
+                        chunk[2] = (s2 + (((p2 & FRAC_MASK_U64) as i32).wrapping_mul(d2) >> 23)) as i16;
+
+                        let i3 = (p3 >> RARE_FRAC_BITS) as usize;
+                        let a3 = &src[i3..i3 + 2];
+                        let s3 = a3[0] as i8 as i32;
+                        let d3 = (a3[1] as i8 as i32) - s3;
+                        chunk[3] = (s3 + (((p3 & FRAC_MASK_U64) as i32).wrapping_mul(d3) >> 23)) as i16;
+                    }
+                    for slot in rem {
+                        let idx = (ph >> RARE_FRAC_BITS) as usize;
+                        let pair = &src[idx..idx + 2];
+                        let s0 = pair[0] as i8 as i32;
+                        let s1 = pair[1] as i8 as i32;
+                        let f = (ph & FRAC_MASK_U64) as i32;
+                        *slot = (s0 + (f.wrapping_mul(s1 - s0) >> 23)) as i16;
+                        ph += step_u64;
+                    }
+                } else if IS_FIRST {
+                    for chunk in chunks {
+                        let p0 = ph;
+                        let p1 = ph + step_u64;
+                        let p2 = ph + step2;
+                        let p3 = ph + step3;
+                        ph += step4;
+
+                        let i0 = (p0 >> RARE_FRAC_BITS) as usize;
+                        let a0 = &src[i0..i0 + 2];
+                        let s0 = a0[0] as i8 as i32;
+                        let d0 = (a0[1] as i8 as i32) - s0;
+                        let v0 = s0 + (((p0 & FRAC_MASK_U64) as i32).wrapping_mul(d0) >> 23);
+                        chunk[0] = (v0.wrapping_mul(vol) >> 7) as i16;
+
+                        let i1 = (p1 >> RARE_FRAC_BITS) as usize;
+                        let a1 = &src[i1..i1 + 2];
+                        let s1 = a1[0] as i8 as i32;
+                        let d1 = (a1[1] as i8 as i32) - s1;
+                        let v1 = s1 + (((p1 & FRAC_MASK_U64) as i32).wrapping_mul(d1) >> 23);
+                        chunk[1] = (v1.wrapping_mul(vol) >> 7) as i16;
+
+                        let i2 = (p2 >> RARE_FRAC_BITS) as usize;
+                        let a2 = &src[i2..i2 + 2];
+                        let s2 = a2[0] as i8 as i32;
+                        let d2 = (a2[1] as i8 as i32) - s2;
+                        let v2 = s2 + (((p2 & FRAC_MASK_U64) as i32).wrapping_mul(d2) >> 23);
+                        chunk[2] = (v2.wrapping_mul(vol) >> 7) as i16;
+
+                        let i3 = (p3 >> RARE_FRAC_BITS) as usize;
+                        let a3 = &src[i3..i3 + 2];
+                        let s3 = a3[0] as i8 as i32;
+                        let d3 = (a3[1] as i8 as i32) - s3;
+                        let v3 = s3 + (((p3 & FRAC_MASK_U64) as i32).wrapping_mul(d3) >> 23);
+                        chunk[3] = (v3.wrapping_mul(vol) >> 7) as i16;
+                    }
+                    for slot in rem {
+                        let idx = (ph >> RARE_FRAC_BITS) as usize;
+                        let pair = &src[idx..idx + 2];
+                        let s0 = pair[0] as i8 as i32;
+                        let s1 = pair[1] as i8 as i32;
+                        let f = (ph & FRAC_MASK_U64) as i32;
+                        let interp = s0 + (f.wrapping_mul(s1 - s0) >> 23);
+                        *slot = (interp.wrapping_mul(vol) >> 7) as i16;
+                        ph += step_u64;
+                    }
+                } else {
+                    for chunk in chunks {
+                        let p0 = ph;
+                        let p1 = ph + step_u64;
+                        let p2 = ph + step2;
+                        let p3 = ph + step3;
+                        ph += step4;
+
+                        let i0 = (p0 >> RARE_FRAC_BITS) as usize;
+                        let a0 = &src[i0..i0 + 2];
+                        let s0 = a0[0] as i8 as i32;
+                        let d0 = (a0[1] as i8 as i32) - s0;
+                        let v0 = s0 + (((p0 & FRAC_MASK_U64) as i32).wrapping_mul(d0) >> 23);
+                        chunk[0] = chunk[0].wrapping_add((v0.wrapping_mul(vol) >> 7) as i16);
+
+                        let i1 = (p1 >> RARE_FRAC_BITS) as usize;
+                        let a1 = &src[i1..i1 + 2];
+                        let s1 = a1[0] as i8 as i32;
+                        let d1 = (a1[1] as i8 as i32) - s1;
+                        let v1 = s1 + (((p1 & FRAC_MASK_U64) as i32).wrapping_mul(d1) >> 23);
+                        chunk[1] = chunk[1].wrapping_add((v1.wrapping_mul(vol) >> 7) as i16);
+
+                        let i2 = (p2 >> RARE_FRAC_BITS) as usize;
+                        let a2 = &src[i2..i2 + 2];
+                        let s2 = a2[0] as i8 as i32;
+                        let d2 = (a2[1] as i8 as i32) - s2;
+                        let v2 = s2 + (((p2 & FRAC_MASK_U64) as i32).wrapping_mul(d2) >> 23);
+                        chunk[2] = chunk[2].wrapping_add((v2.wrapping_mul(vol) >> 7) as i16);
+
+                        let i3 = (p3 >> RARE_FRAC_BITS) as usize;
+                        let a3 = &src[i3..i3 + 2];
+                        let s3 = a3[0] as i8 as i32;
+                        let d3 = (a3[1] as i8 as i32) - s3;
+                        let v3 = s3 + (((p3 & FRAC_MASK_U64) as i32).wrapping_mul(d3) >> 23);
+                        chunk[3] = chunk[3].wrapping_add((v3.wrapping_mul(vol) >> 7) as i16);
+                    }
+                    for slot in rem {
+                        let idx = (ph >> RARE_FRAC_BITS) as usize;
+                        let pair = &src[idx..idx + 2];
+                        let s0 = pair[0] as i8 as i32;
+                        let s1 = pair[1] as i8 as i32;
+                        let f = (ph & FRAC_MASK_U64) as i32;
+                        let interp = s0 + (f.wrapping_mul(s1 - s0) >> 23);
+                        let scaled = (interp.wrapping_mul(vol) >> 7) as i16;
+                        *slot = slot.wrapping_add(scaled);
+                        ph += step_u64;
+                    }
+                }
+
+                pos = (ph >> RARE_FRAC_BITS) as usize;
+                frac = (ph & FRAC_MASK_U64) as u32;
+                offset += run;
+                if pos >= sample_len {
+                    if is_looped {
+                        pos = pos.saturating_sub(loop_len);
+                    } else {
+                        voice.active = false;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // Boundary / missing-guard / zero-step single-sample fallback
+            let (s0, s1) = sample.sample_pair_i32(pos);
+            let interp = s0 + (((frac as i32).wrapping_mul(s1 - s0)) >> 23);
+            let scaled = (interp.wrapping_mul(vol) >> 7) as i16;
+
+            if IS_FIRST {
+                acc[offset] = scaled;
+            } else {
+                acc[offset] = acc[offset].wrapping_add(scaled);
+            }
+            offset += 1;
+
+            frac = frac.wrapping_add(step);
+            pos += (frac >> RARE_FRAC_BITS) as usize;
+            frac &= RARE_FRAC_MASK;
+
+            if pos >= sample_len {
+                if is_looped {
+                    pos = pos.saturating_sub(loop_len);
+                } else {
+                    voice.active = false;
+                    break;
+                }
+            }
+        }
+
+        voice.pos = pos;
+        voice.frac = frac;
+    }
+
     /// Mix a single voice into a 16-bit signed scratch accumulator (`acc`), matching the
     /// exact ARM7TDMI instructions of `version`.
     ///
@@ -179,10 +445,10 @@ impl AccuracySynth {
             return;
         }
 
+        const FRAC_MASK_U64: u64 = RARE_FRAC_MASK as u64;
+
         let n = acc.len();
         let sample_len = sample.sample_len;
-        let loop_len = sample.loop_length as usize;
-        let is_looped = voice.playback_mode.is_looped() && loop_len > 0;
         let step = voice.step_q23;
         let vol = voice.volume;
 
@@ -196,11 +462,148 @@ impl AccuracySynth {
                 .wrapping_add(voice.frac as u64);
             let end_pos = voice.pos.saturating_add((total_q23 >> RARE_FRAC_BITS) as usize);
             if end_pos < sample_len {
+                let pcm = sample.pcm;
+
+                if step == RARE_FRAC_ONE && voice.frac == 0 && voice.pos + n <= pcm.len() {
+                    // 1:1 pitch 2x-packed fast path preserving exact ARM `-1` carry bleed
+                    let (src_pairs, _) = pcm[voice.pos..voice.pos + n].as_chunks::<2>();
+                    let (dst_pairs, _) = acc.as_chunks_mut::<2>();
+                    for (s_pair, dst) in src_pairs.iter().zip(dst_pairs.iter_mut()) {
+                        let scaled0 = (s_pair[0] as i8 as i32).wrapping_mul(vol) >> 7;
+                        let scaled1 = (s_pair[1] as i8 as i32).wrapping_mul(vol) >> 7;
+                        let packed = (scaled0 as u32).wrapping_add((scaled1 as u32) << 16);
+                        dst[0] = (packed & 0xFFFF) as i16;
+                        dst[1] = (packed >> 16) as i16;
+                    }
+                    voice.pos += n;
+                    return;
+                }
+
+                if voice.frac <= RARE_FRAC_MASK
+                    && step <= 0x7FFF_FFFF
+                    && end_pos + 1 < pcm.len()
+                {
+                    // Guarded interior 2x-packed fast path: single 64-bit phase accumulator,
+                    // 4-sample (2-pair) unrolling, zero per-sample bounds checks on `acc`,
+                    // exact ARM `-1` carry bleed.
+                    let src = &pcm[..end_pos + 2];
+                    let step_u64 = step as u64;
+                    let step2 = step_u64 * 2;
+                    let step3 = step_u64 * 3;
+                    let step4 = step_u64 * 4;
+                    let mut ph = ((voice.pos as u64) << RARE_FRAC_BITS) | (voice.frac as u64);
+
+                    let (chunks, rem) = acc.as_chunks_mut::<4>();
+                    if vol == 128 {
+                        for dst in chunks {
+                            let p0 = ph;
+                            let p1 = ph + step_u64;
+                            let p2 = ph + step2;
+                            let p3 = ph + step3;
+                            ph += step4;
+
+                            let i0 = (p0 >> RARE_FRAC_BITS) as usize;
+                            let a0 = &src[i0..i0 + 2];
+                            let s0 = a0[0] as i8 as i32;
+                            let sc0 = s0 + (((p0 & FRAC_MASK_U64) as i32).wrapping_mul((a0[1] as i8 as i32) - s0) >> 23);
+
+                            let i1 = (p1 >> RARE_FRAC_BITS) as usize;
+                            let a1 = &src[i1..i1 + 2];
+                            let s1 = a1[0] as i8 as i32;
+                            let sc1 = s1 + (((p1 & FRAC_MASK_U64) as i32).wrapping_mul((a1[1] as i8 as i32) - s1) >> 23);
+
+                            let packed0 = (sc0 as u32).wrapping_add((sc1 as u32) << 16);
+                            dst[0] = (packed0 & 0xFFFF) as i16;
+                            dst[1] = (packed0 >> 16) as i16;
+
+                            let i2 = (p2 >> RARE_FRAC_BITS) as usize;
+                            let a2 = &src[i2..i2 + 2];
+                            let s2 = a2[0] as i8 as i32;
+                            let sc2 = s2 + (((p2 & FRAC_MASK_U64) as i32).wrapping_mul((a2[1] as i8 as i32) - s2) >> 23);
+
+                            let i3 = (p3 >> RARE_FRAC_BITS) as usize;
+                            let a3 = &src[i3..i3 + 2];
+                            let s3 = a3[0] as i8 as i32;
+                            let sc3 = s3 + (((p3 & FRAC_MASK_U64) as i32).wrapping_mul((a3[1] as i8 as i32) - s3) >> 23);
+
+                            let packed1 = (sc2 as u32).wrapping_add((sc3 as u32) << 16);
+                            dst[2] = (packed1 & 0xFFFF) as i16;
+                            dst[3] = (packed1 >> 16) as i16;
+                        }
+                    } else {
+                        for dst in chunks {
+                            let p0 = ph;
+                            let p1 = ph + step_u64;
+                            let p2 = ph + step2;
+                            let p3 = ph + step3;
+                            ph += step4;
+
+                            let i0 = (p0 >> RARE_FRAC_BITS) as usize;
+                            let a0 = &src[i0..i0 + 2];
+                            let s0 = a0[0] as i8 as i32;
+                            let sc0 = (s0 + (((p0 & FRAC_MASK_U64) as i32).wrapping_mul((a0[1] as i8 as i32) - s0) >> 23)).wrapping_mul(vol) >> 7;
+
+                            let i1 = (p1 >> RARE_FRAC_BITS) as usize;
+                            let a1 = &src[i1..i1 + 2];
+                            let s1 = a1[0] as i8 as i32;
+                            let sc1 = (s1 + (((p1 & FRAC_MASK_U64) as i32).wrapping_mul((a1[1] as i8 as i32) - s1) >> 23)).wrapping_mul(vol) >> 7;
+
+                            let packed0 = (sc0 as u32).wrapping_add((sc1 as u32) << 16);
+                            dst[0] = (packed0 & 0xFFFF) as i16;
+                            dst[1] = (packed0 >> 16) as i16;
+
+                            let i2 = (p2 >> RARE_FRAC_BITS) as usize;
+                            let a2 = &src[i2..i2 + 2];
+                            let s2 = a2[0] as i8 as i32;
+                            let sc2 = (s2 + (((p2 & FRAC_MASK_U64) as i32).wrapping_mul((a2[1] as i8 as i32) - s2) >> 23)).wrapping_mul(vol) >> 7;
+
+                            let i3 = (p3 >> RARE_FRAC_BITS) as usize;
+                            let a3 = &src[i3..i3 + 2];
+                            let s3 = a3[0] as i8 as i32;
+                            let sc3 = (s3 + (((p3 & FRAC_MASK_U64) as i32).wrapping_mul((a3[1] as i8 as i32) - s3) >> 23)).wrapping_mul(vol) >> 7;
+
+                            let packed1 = (sc2 as u32).wrapping_add((sc3 as u32) << 16);
+                            dst[2] = (packed1 & 0xFFFF) as i16;
+                            dst[3] = (packed1 >> 16) as i16;
+                        }
+                    }
+
+                    for dst in rem.as_chunks_mut::<2>().0 {
+                        let idx0 = (ph >> RARE_FRAC_BITS) as usize;
+                        let pair0 = &src[idx0..idx0 + 2];
+                        let s0_a = pair0[0] as i8 as i32;
+                        let s1_a = pair0[1] as i8 as i32;
+                        let f0 = (ph & FRAC_MASK_U64) as i32;
+                        let interp0 = s0_a + (f0.wrapping_mul(s1_a - s0_a) >> 23);
+                        let scaled0 = interp0.wrapping_mul(vol) >> 7;
+                        ph += step_u64;
+
+                        let idx1 = (ph >> RARE_FRAC_BITS) as usize;
+                        let pair1 = &src[idx1..idx1 + 2];
+                        let s0_b = pair1[0] as i8 as i32;
+                        let s1_b = pair1[1] as i8 as i32;
+                        let f1 = (ph & FRAC_MASK_U64) as i32;
+                        let interp1 = s0_b + (f1.wrapping_mul(s1_b - s0_b) >> 23);
+                        let scaled1 = interp1.wrapping_mul(vol) >> 7;
+                        ph += step_u64;
+
+                        // Authentic Banjo-Pilot ARM `add r2, sl, r2, lsl #16`:
+                        // `scaled0 as u32` has 0xFFFF in upper 16 bits when `scaled0 < 0`,
+                        // which subtracts 1 from `scaled1` in the upper halfword!
+                        let packed = (scaled0 as u32).wrapping_add((scaled1 as u32) << 16);
+                        dst[0] = (packed & 0xFFFF) as i16;
+                        dst[1] = (packed >> 16) as i16;
+                    }
+
+                    voice.pos = (ph >> RARE_FRAC_BITS) as usize;
+                    voice.frac = (ph & FRAC_MASK_U64) as u32;
+                    return;
+                }
+
+                // Safe fallback if sample lacks trailing guard byte or has unmasked frac
                 let mut pos = voice.pos;
                 let mut frac = voice.frac;
-
-                let mut k = 0usize;
-                while k < n {
+                for dst in acc.as_chunks_mut::<2>().0 {
                     let (s0_a, s1_a) = sample.sample_pair_i32(pos);
                     let interp0 = s0_a + (((frac as i32).wrapping_mul(s1_a - s0_a)) >> 23);
                     let scaled0 = interp0.wrapping_mul(vol) >> 7;
@@ -215,13 +618,9 @@ impl AccuracySynth {
                     pos += (frac >> RARE_FRAC_BITS) as usize;
                     frac &= RARE_FRAC_MASK;
 
-                    // Authentic Banjo-Pilot ARM `add r2, sl, r2, lsl #16`:
-                    // `scaled0 as u32` has 0xFFFF in upper 16 bits when `scaled0 < 0`,
-                    // which subtracts 1 from `scaled1` in the upper halfword!
                     let packed = (scaled0 as u32).wrapping_add((scaled1 as u32) << 16);
-                    acc[k] = (packed & 0xFFFF) as i16;
-                    acc[k + 1] = (packed >> 16) as i16;
-                    k += 2;
+                    dst[0] = (packed & 0xFFFF) as i16;
+                    dst[1] = (packed >> 16) as i16;
                 }
 
                 voice.pos = pos;
@@ -232,36 +631,11 @@ impl AccuracySynth {
 
         // Standard per-sample `strh`/`ldrsh` path (all Standard variants, Banjo-Pilot slow path,
         // and Banjo-Pilot 4x-unrolled `ror #16` accumulate path which has zero cross-halfword bleed).
-        let mut pos = voice.pos;
-        let mut frac = voice.frac;
-
-        for slot in acc.iter_mut() {
-            let (s0, s1) = sample.sample_pair_i32(pos);
-            let interp = s0 + (((frac as i32).wrapping_mul(s1 - s0)) >> 23);
-            let scaled = (interp.wrapping_mul(vol) >> 7) as i16;
-
-            if is_first {
-                *slot = scaled;
-            } else {
-                *slot = slot.wrapping_add(scaled);
-            }
-
-            frac = frac.wrapping_add(step);
-            pos += (frac >> RARE_FRAC_BITS) as usize;
-            frac &= RARE_FRAC_MASK;
-
-            if pos >= sample_len {
-                if is_looped {
-                    pos = pos.saturating_sub(loop_len);
-                } else {
-                    voice.active = false;
-                    break;
-                }
-            }
+        if is_first {
+            Self::mix_standard_impl::<true>(sample, voice, acc);
+        } else {
+            Self::mix_standard_impl::<false>(sample, voice, acc);
         }
-
-        voice.pos = pos;
-        voice.frac = frac;
     }
 
     /// Mix a single voice using [`RareAudioVersion::StandardSingleClamp`].
@@ -287,8 +661,8 @@ impl AccuracySynth {
     #[inline]
     pub fn clamp_i16_to_dma8(acc: &[i16], dma_out: &mut [i8]) {
         let n = acc.len().min(dma_out.len());
-        for i in 0..n {
-            dma_out[i] = acc[i].clamp(-128, 127) as i8;
+        for (&a, d) in acc[..n].iter().zip(dma_out[..n].iter_mut()) {
+            *d = a.clamp(-128, 127) as i8;
         }
     }
 
@@ -314,11 +688,11 @@ impl AccuracySynth {
 /// High-fidelity 48,000 Hz `f32` stereo software synthesizer for Rareware GBA samples.
 ///
 /// Replaces the GBA's 13,379 Hz mono 8-bit linear-interpolated DirectSound A pipeline with
-/// a compile-time normalized 6-tap Lanczos-3 windowed-sinc polyphase resampler and true
-/// equal-power stereo panning (`cos/sin` via `sqrt((1 ± pan) / 2)`).
-#[derive(Debug, Clone)]
+/// a compile-time normalized 1,024-phase 6-tap Lanczos-3 windowed-sinc polyphase resampler
+/// and true equal-power stereo panning (`sqrt((1 ± pan) / 2)`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct StudioSynth {
-    /// Output sample rate in Hz (default `48,000` Hz).
+    /// Output sample rate in Hz (default [`Self::SAMPLE_RATE`] = `48,000` Hz).
     pub output_rate: u32,
     /// Native Rareware mixer reference rate used to interpret `RareVoice::step_q23` (default `13,379` Hz).
     pub source_mix_rate: u32,
@@ -329,11 +703,14 @@ pub struct StudioSynth {
 
 impl Default for StudioSynth {
     fn default() -> Self {
-        Self::new(48_000)
+        Self::new(Self::SAMPLE_RATE)
     }
 }
 
 impl StudioSynth {
+    /// Standard studio output sample rate (`48,000` Hz).
+    pub const SAMPLE_RATE: u32 = 48_000;
+
     /// Create a new `StudioSynth` at `output_rate` Hz (typically `48,000` Hz).
     #[must_use]
     pub fn new(output_rate: u32) -> Self {
@@ -360,15 +737,34 @@ impl StudioSynth {
     #[inline]
     #[must_use]
     pub fn sample_lanczos3(sample: &RareSampleView<'_>, pos: usize, frac: f64) -> f32 {
-        let phase_idx = ((frac * (LANCZOS_PHASES as f64)) as usize).min(LANCZOS_PHASES);
-        let weights = &LANCZOS3_LUT[phase_idx];
-        let len = sample.sample_len as isize;
+        let phase_idx = ((frac * (LANCZOS_PHASES as f64) + 0.5) as usize).min(LANCZOS_PHASES);
+        let w = &LANCZOS3_LUT[phase_idx];
+        let effective_len = sample.sample_len.min(sample.pcm.len());
+        if effective_len == 0 {
+            return 0.0;
+        }
+
+        // Fast interior path: all 6 taps in bounds with zero boundary branches
+        if pos >= 2 && pos + 3 < effective_len {
+            let win = &sample.pcm[pos - 2..pos + 4];
+            let s0 = (win[0] as i8) as f32;
+            let s1 = (win[1] as i8) as f32;
+            let s2 = (win[2] as i8) as f32;
+            let s3 = (win[3] as i8) as f32;
+            let s4 = (win[4] as i8) as f32;
+            let s5 = (win[5] as i8) as f32;
+            let val =
+                (s0 * w[0] + s1 * w[1]) + (s2 * w[2] + s3 * w[3]) + (s4 * w[4] + s5 * w[5]);
+            return val * (1.0 / 128.0);
+        }
+
+        let len = effective_len as isize;
         let is_looped = sample.is_looped();
         let loop_len = sample.loop_length as isize;
         let loop_start = len - loop_len;
 
         let mut acc = 0.0f32;
-        for (tap, &w) in weights.iter().enumerate() {
+        for (tap, &wt) in w.iter().enumerate() {
             let mut idx = (pos as isize) + (tap as isize) - 2;
             if idx < 0 {
                 idx = 0;
@@ -379,10 +775,10 @@ impl StudioSynth {
                     idx = len - 1;
                 }
             }
-            let s = (sample.sample_i8(idx as usize) as f32) / 128.0;
-            acc += s * w;
+            let s = (sample.pcm[idx as usize] as i8) as f32;
+            acc += s * wt;
         }
-        acc
+        acc * (1.0 / 128.0)
     }
 
     /// Render a single voice into separate left/right `f32` buffers using band-limited
@@ -420,47 +816,148 @@ impl StudioSynth {
         if n == 0 {
             return;
         }
+        let pcm = sample.pcm;
+        let sample_len = sample.sample_len.min(pcm.len());
+        if sample_len == 0 {
+            return;
+        }
 
         // Convert Q9.23 step at source_mix_rate to floating-point step at output_rate
         let step_at_mix = (voice.step_q23 as f64) / ((1u64 << RARE_FRAC_BITS) as f64);
         let step_out = step_at_mix * (source_mix_rate as f64) / (output_rate as f64);
 
-        let vol_gain = (voice.volume as f32) / 128.0;
+        // Bake PCM `1/128` normalization directly into stereo gains once per voice
+        let vol_gain = (voice.volume as f32) * (1.0 / (128.0 * 128.0));
         let (pan_l, pan_r) = Self::equal_power_gains(voice.pan);
         let gain_l = vol_gain * pan_l;
         let gain_r = vol_gain * pan_r;
 
-        let sample_len = sample.sample_len;
         let loop_len = sample.loop_length as usize;
-        let is_looped = voice.playback_mode.is_looped() && loop_len > 0;
+        let is_looped = voice.playback_mode.is_looped() && loop_len > 0 && loop_len <= sample_len;
+        let loop_start = sample_len.saturating_sub(loop_len);
+        let sample_len_f = sample_len as f64;
+        let loop_len_f = loop_len as f64;
+        let safe_max_base = sample_len.saturating_sub(4);
 
-        let mut pos_f = (voice.pos as f64) + ((voice.frac as f64) / ((1u64 << RARE_FRAC_BITS) as f64));
+        let out_l = &mut out_l[..n];
+        let out_r = &mut out_r[..n];
 
-        for i in 0..n {
-            let pos_i = pos_f as usize;
-            if pos_i >= sample_len {
-                voice.active = false;
-                break;
-            }
-            let frac = pos_f - (pos_i as f64);
-            let s = Self::sample_lanczos3(sample, pos_i, frac);
-            out_l[i] += s * gain_l;
-            out_r[i] += s * gain_r;
+        let mut pos_f =
+            (voice.pos as f64) + ((voice.frac as f64) / ((1u64 << RARE_FRAC_BITS) as f64));
+        let mut idx = 0usize;
 
-            pos_f += step_out;
-            if pos_f >= (sample_len as f64) {
+        while idx < n {
+            if pos_f >= sample_len_f {
                 if is_looped {
-                    while pos_f >= (sample_len as f64) {
-                        pos_f -= loop_len as f64;
+                    pos_f -= loop_len_f;
+                    if pos_f >= sample_len_f {
+                        let loop_start_f = loop_start as f64;
+                        pos_f = loop_start_f + ((pos_f - loop_start_f) % loop_len_f);
                     }
                 } else {
                     voice.active = false;
                     break;
                 }
             }
+
+            let base = pos_f as usize;
+            // Interior Q32.32 fixed-point fast path: zero boundary checks, zero modulo,
+            // direct 6-tap slice loads, and balanced FMA reduction tree.
+            if sample_len >= 6
+                && base >= 2
+                && base <= safe_max_base
+                && step_out > 0.0
+                && step_out < (1u64 << 31) as f64
+            {
+                let safe_limit = (safe_max_base as f64) + 0.999_999;
+                let max_interior = (((safe_limit - pos_f) / step_out) as usize) + 1;
+                let run = max_interior.min(n - idx);
+                if run >= 4 {
+                    const Q32_SCALE: f64 = 4_294_967_296.0;
+                    let ph_q32 = (pos_f * Q32_SCALE) as u64;
+                    let step_q32 = (step_out * Q32_SCALE) as u64;
+                    let last_base = ((ph_q32
+                        .saturating_add(step_q32.saturating_mul((run - 1) as u64)))
+                        >> 32) as usize;
+                    if last_base <= safe_max_base {
+                        let src = &pcm[..last_base + 4];
+                        let mut ph_shifted = ph_q32 - (2u64 << 32);
+                        for (ol, or) in out_l[idx..idx + run]
+                            .iter_mut()
+                            .zip(&mut out_r[idx..idx + run])
+                        {
+                            let b0 = (ph_shifted >> 32) as usize;
+                            // Nearest 1,024-phase index in `0..=1024`
+                            let p = (((ph_shifted & 0xFFFF_FFFF) + (1 << 21)) >> 22) as usize;
+                            let w = &LANCZOS3_LUT[p];
+                            let win = &src[b0..b0 + 6];
+                            let s0 = (win[0] as i8) as f32;
+                            let s1 = (win[1] as i8) as f32;
+                            let s2 = (win[2] as i8) as f32;
+                            let s3 = (win[3] as i8) as f32;
+                            let s4 = (win[4] as i8) as f32;
+                            let s5 = (win[5] as i8) as f32;
+                            // Balanced reduction tree halves FMA dependency chain latency
+                            let val = (s0 * w[0] + s1 * w[1])
+                                + (s2 * w[2] + s3 * w[3])
+                                + (s4 * w[4] + s5 * w[5]);
+                            *ol += val * gain_l;
+                            *or += val * gain_r;
+                            ph_shifted += step_q32;
+                        }
+                        pos_f += (run as f64) * step_out;
+                        idx += run;
+                        continue;
+                    }
+                }
+            }
+
+            // Boundary / loop-edge single-sample step
+            if base >= sample_len {
+                voice.active = false;
+                break;
+            }
+            let frac = pos_f - (base as f64);
+            let p = ((frac * (LANCZOS_PHASES as f64) + 0.5) as usize).min(LANCZOS_PHASES);
+            let w = &LANCZOS3_LUT[p];
+            let len_i = sample_len as isize;
+            let loop_len_i = loop_len as isize;
+            let loop_start_i = loop_start as isize;
+
+            let mut val = 0.0f32;
+            for (tap, &wt) in w.iter().enumerate() {
+                let mut s_idx = (base as isize) + (tap as isize) - 2;
+                if s_idx < 0 {
+                    s_idx = 0;
+                } else if s_idx >= len_i {
+                    if is_looped {
+                        s_idx = loop_start_i + ((s_idx - loop_start_i) % loop_len_i);
+                    } else {
+                        s_idx = len_i - 1;
+                    }
+                }
+                val += ((pcm[s_idx as usize] as i8) as f32) * wt;
+            }
+
+            out_l[idx] += val * gain_l;
+            out_r[idx] += val * gain_r;
+            pos_f += step_out;
+            idx += 1;
         }
 
         if voice.active {
+            if pos_f >= sample_len_f {
+                if is_looped {
+                    pos_f -= loop_len_f;
+                    if pos_f >= sample_len_f {
+                        let loop_start_f = loop_start as f64;
+                        pos_f = loop_start_f + ((pos_f - loop_start_f) % loop_len_f);
+                    }
+                } else {
+                    voice.active = false;
+                    return;
+                }
+            }
             let pos_i = pos_f as usize;
             let frac = pos_f - (pos_i as f64);
             voice.pos = pos_i;
@@ -496,9 +993,117 @@ impl StudioSynth {
                 );
             }
         }
-        for i in 0..frames {
-            interleaved_out[i * 2] = l[i];
-            interleaved_out[i * 2 + 1] = r[i];
+        for (pair, (&sl, &sr)) in interleaved_out
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(l.iter().zip(r.iter()))
+        {
+            pair[0] = sl;
+            pair[1] = sr;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sample::RarePlaybackMode;
+
+    #[test]
+    fn test_studio_synth_1024_lut_matches_direct_lanczos3() {
+        let mut pcm = [0u8; 65];
+        for (i, slot) in pcm.iter_mut().enumerate() {
+            let v = (const_sin((i as f64) * 0.35) * 100.0) as i8;
+            *slot = v as u8;
+        }
+        let view = RareSampleView::from_signed_pcm(
+            0,
+            RARE_DEFAULT_MIX_RATE,
+            60,
+            RarePlaybackMode::MidiOneShot,
+            0,
+            &pcm,
+            true,
+        );
+        let synth = StudioSynth::new(StudioSynth::SAMPLE_RATE);
+        let mut voice = RareVoice::with_phase(
+            0,
+            RarePlaybackMode::MidiOneShot,
+            5,
+            0x0020_0000, // 0.25
+            RARE_FRAC_ONE,
+            128,
+        );
+        let mut out_l = [0.0f32; 128];
+        let mut out_r = [0.0f32; 128];
+        synth.mix_voice_view_stereo(&view, &mut voice, &mut out_l, &mut out_r);
+
+        let step = (RARE_DEFAULT_MIX_RATE as f64) / (StudioSynth::SAMPLE_RATE as f64);
+        let (gain_l, _) = StudioSynth::equal_power_gains(0.0);
+        let mut ref_pos = 5.25f64;
+        for &actual in &out_l {
+            let center = ref_pos as isize;
+            let mut acc = 0.0f64;
+            let mut wsum = 0.0f64;
+            for k in (center - 2)..=(center + 3) {
+                let s = (pcm[k as usize] as i8) as f64 / 128.0;
+                let w = lanczos_kernel(ref_pos - (k as f64), 3.0);
+                acc += s * w;
+                wsum += w;
+            }
+            let expected = ((acc / wsum) as f32) * gain_l;
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "LUT mismatch: actual={actual}, expected={expected}"
+            );
+            ref_pos += step;
+        }
+    }
+
+    #[test]
+    fn test_packed_fast_path_1to1_preserves_negative_bleed() {
+        let pcm: [u8; 9] = [
+            (-10i8) as u8,
+            20u8,
+            10u8,
+            20u8,
+            (-1i8) as u8,
+            0u8,
+            0u8,
+            (-5i8) as u8,
+            0u8,
+        ];
+        let view = RareSampleView::from_signed_pcm(
+            0,
+            RARE_DEFAULT_MIX_RATE,
+            60,
+            RarePlaybackMode::MidiOneShot,
+            0,
+            &pcm,
+            true,
+        );
+        let mut voice = RareVoice::with_phase(
+            0,
+            RarePlaybackMode::MidiOneShot,
+            0,
+            0,
+            RARE_FRAC_ONE,
+            128,
+        );
+        let mut acc = [0i16; 6];
+        AccuracySynth::mix_voice_view_version(
+            &view,
+            &mut voice,
+            &mut acc,
+            true,
+            RareAudioVersion::PackedFastPath,
+        );
+        // Pair 0: (-10, 20) -> -10 < 0 bleeds -1 into 20 => (-10, 19)
+        // Pair 1: (10, 20)  -> 10 >= 0, no bleed => (10, 20)
+        // Pair 2: (-1, 0)   -> -1 < 0 bleeds -1 into 0 => (-1, -1)
+        assert_eq!(acc, [-10, 19, 10, 20, -1, -1]);
+        assert_eq!(voice.pos, 6);
+        assert_eq!(voice.frac, 0);
     }
 }
